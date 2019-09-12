@@ -1,0 +1,7 @@
+/usr/lib/debug/.build-id/37/136d6713f93ec2df2b2ba581ec51f3aea8b7d4 /usr/lib64/libseccomp.so.2.3.1
+/usr/lib/debug/.build-id/37/136d6713f93ec2df2b2ba581ec51f3aea8b7d4.debug /usr/lib/debug/usr/lib64/libseccomp.so.2.3.1.debug
+/usr/lib/debug/.build-id/54/98791d54f9db62eae82220d16e6e32a38b2925 /usr/bin/scmp_sys_resolver
+/usr/lib/debug/.build-id/54/98791d54f9db62eae82220d16e6e32a38b2925.debug /usr/lib/debug/usr/bin/scmp_sys_resolver.debug
+/usr/lib/debug/.build-id/24/c63f8df21c0b7c3de385309708492b78c81b50.debug /usr/lib/debug/.dwz/libseccomp-2.3.1-3.el7.x86_64
+/usr/lib/debug/usr/lib64/libseccomp.so.2.debug /usr/lib/debug/usr/lib64/libseccomp.so.2.3.1.debug
+/usr/lib/debug/usr/lib64/libseccomp.so.debug /usr/lib/debug/usr/lib64/libseccomp.so.2.3.1.debug
