@@ -1,0 +1,320 @@
+commit 634bc3d1595fe699693730bd9566178da741a832
+Author: Guozhen She <hazelnutsgz@gmail.com>
+Date:   Sat Aug 24 15:20:40 2019 -0400
+
+    First commit
+
+diff --git a/include/linux/seccomp.h b/include/linux/seccomp.h
+index 84868d3..a18383b 100644
+--- a/include/linux/seccomp.h
++++ b/include/linux/seccomp.h
+@@ -13,6 +13,7 @@
+ 
+ #include <linux/thread_info.h>
+ #include <asm/seccomp.h>
++#include <linux/list.h>
+ 
+ struct seccomp_filter;
+ /**
+@@ -26,11 +27,22 @@
+  *          @filter must only be accessed from the context of current as there
+  *          is no read locking.
+  */
++struct seccomp_draco_block {
++	struct list_head list; 
++	int syscall;
++	int arg_position;
++};
++
+ struct seccomp {
+ 	int mode;
+ 	struct seccomp_filter *filter;
++	void *draco_hook;
++	struct list_head draco_head;
+ };
+ 
++extern int (*draco_checker)(int, struct pt_regs*);
++extern int (*draco_checker_backup)(int, struct pt_regs*);
++
+ #ifdef CONFIG_HAVE_ARCH_SECCOMP_FILTER
+ extern int __secure_computing(const struct seccomp_data *sd);
+ static inline int secure_computing(const struct seccomp_data *sd)
+@@ -45,6 +57,7 @@ static inline int secure_computing(const struct seccomp_data *sd)
+ 
+ extern long prctl_get_seccomp(void);
+ extern long prctl_set_seccomp(unsigned long, void __user *);
++extern long prctl_draco_seccomp(int, int);
+ 
+ static inline int seccomp_mode(struct seccomp *s)
+ {
+diff --git a/include/uapi/linux/prctl.h b/include/uapi/linux/prctl.h
+index 094bb03..b91a608 100644
+--- a/include/uapi/linux/prctl.h
++++ b/include/uapi/linux/prctl.h
+@@ -66,6 +66,7 @@
+ /* Get/set process seccomp mode */
+ #define PR_GET_SECCOMP	21
+ #define PR_SET_SECCOMP	22
++#define PR_DRACO_SECCOMP 1000
+ 
+ /* Get/set the capability bounding set (as per security/commoncap.c) */
+ #define PR_CAPBSET_READ 23
+diff --git a/kernel/fork.c b/kernel/fork.c
+index d3f006e..666f529 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -888,6 +888,8 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
+ 	 * the usage counts on the error path calling free_task.
+ 	 */
+ 	tsk->seccomp.filter = NULL;
++	tsk->seccomp.draco_hook = NULL;
++	INIT_LIST_HEAD(&tsk->seccomp.draco_head);
+ #endif
+ 
+ 	setup_thread_stack(tsk, orig);
+diff --git a/kernel/seccomp.c b/kernel/seccomp.c
+index 811b4a8..2de4eed 100644
+--- a/kernel/seccomp.c
++++ b/kernel/seccomp.c
+@@ -917,17 +917,33 @@ static int __seccomp_filter(int this_syscall, const struct seccomp_data *sd,
+ }
+ #endif
+ 
++int empty_draco(int this_syscall, struct pt_regs *regs) 
++{
++	return 0;
++}
++
++int (*draco_checker)(int, struct pt_regs*) = empty_draco;
++int (*draco_checker_backup)(int, struct pt_regs*) = empty_draco;
++
++EXPORT_SYMBOL(draco_checker);
++EXPORT_SYMBOL(draco_checker_backup);
++
+ int __secure_computing(const struct seccomp_data *sd)
+ {
+ 	int mode = current->seccomp.mode;
+ 	int this_syscall;
+-
++	
+ 	if (IS_ENABLED(CONFIG_CHECKPOINT_RESTORE) &&
+ 	    unlikely(current->ptrace & PT_SUSPEND_SECCOMP))
+ 		return 0;
+ 
+ 	this_syscall = sd ? sd->nr :
+ 		syscall_get_nr(current, task_pt_regs(current));
++	
++	if ((*draco_checker)(this_syscall, task_pt_regs(current))) 
++	{
++		return 0;
++	}
+ 
+ 	switch (mode) {
+ 	case SECCOMP_MODE_STRICT:
+@@ -1442,6 +1458,20 @@ long prctl_set_seccomp(unsigned long seccomp_mode, void __user *filter)
+ 	return do_seccomp(op, 0, uargs);
+ }
+ 
++long prctl_draco_seccomp(int syscall, int arg_position) 
++{	
++	struct seccomp_draco_block* inserted = kmalloc(sizeof(struct seccomp_draco_block), GFP_KERNEL);
++	if (inserted == NULL) 
++		return -ENOMEM;	
++
++	inserted->arg_position = arg_position;
++	inserted->syscall = syscall;
++
++	list_add(&inserted->list, &current->seccomp.draco_head);
++	
++	return 0;
++}
++
+ #if defined(CONFIG_SECCOMP_FILTER) && defined(CONFIG_CHECKPOINT_RESTORE)
+ static struct seccomp_filter *get_nth_filter(struct task_struct *task,
+ 					     unsigned long filter_off)
+diff --git a/kernel/sys.c b/kernel/sys.c
+index 2969304..7ab0ab5 100644
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@ -2353,6 +2353,9 @@ int __weak arch_prctl_spec_ctrl_set(struct task_struct *t, unsigned long which,
+ 	case PR_SET_SECCOMP:
+ 		error = prctl_set_seccomp(arg2, (char __user *)arg3);
+ 		break;
++	case PR_DRACO_SECCOMP:
++		error = prctl_draco_seccomp(arg2, arg3);
++		break;
+ 	case PR_GET_TSC:
+ 		error = GET_TSC_CTL(arg2);
+ 		break;
+diff --git a/tools/include/uapi/linux/prctl.h b/tools/include/uapi/linux/prctl.h
+index 094bb03..b91a608 100644
+--- a/tools/include/uapi/linux/prctl.h
++++ b/tools/include/uapi/linux/prctl.h
+@@ -66,6 +66,7 @@
+ /* Get/set process seccomp mode */
+ #define PR_GET_SECCOMP	21
+ #define PR_SET_SECCOMP	22
++#define PR_DRACO_SECCOMP 1000
+ 
+ /* Get/set the capability bounding set (as per security/commoncap.c) */
+ #define PR_CAPBSET_READ 23
+commit 63a192532816c70852f0f0667b4932c412b58448
+Author: Guozhen She <hazelnutsgz@gmail.com>
+Date:   Sat Aug 24 15:20:40 2019 -0400
+
+    First commit
+
+diff --git a/include/linux/seccomp.h b/include/linux/seccomp.h
+index 84868d3..a18383b 100644
+--- a/include/linux/seccomp.h
++++ b/include/linux/seccomp.h
+@@ -13,6 +13,7 @@
+ 
+ #include <linux/thread_info.h>
+ #include <asm/seccomp.h>
++#include <linux/list.h>
+ 
+ struct seccomp_filter;
+ /**
+@@ -26,11 +27,22 @@
+  *          @filter must only be accessed from the context of current as there
+  *          is no read locking.
+  */
++struct seccomp_draco_block {
++	struct list_head list; 
++	int syscall;
++	int arg_position;
++};
++
+ struct seccomp {
+ 	int mode;
+ 	struct seccomp_filter *filter;
++	void *draco_hook;
++	struct list_head draco_head;
+ };
+ 
++extern int (*draco_checker)(int, struct pt_regs*);
++extern int (*draco_checker_backup)(int, struct pt_regs*);
++
+ #ifdef CONFIG_HAVE_ARCH_SECCOMP_FILTER
+ extern int __secure_computing(const struct seccomp_data *sd);
+ static inline int secure_computing(const struct seccomp_data *sd)
+@@ -45,6 +57,7 @@ static inline int secure_computing(const struct seccomp_data *sd)
+ 
+ extern long prctl_get_seccomp(void);
+ extern long prctl_set_seccomp(unsigned long, void __user *);
++extern long prctl_draco_seccomp(int, int);
+ 
+ static inline int seccomp_mode(struct seccomp *s)
+ {
+diff --git a/include/uapi/linux/prctl.h b/include/uapi/linux/prctl.h
+index 094bb03..b91a608 100644
+--- a/include/uapi/linux/prctl.h
++++ b/include/uapi/linux/prctl.h
+@@ -66,6 +66,7 @@
+ /* Get/set process seccomp mode */
+ #define PR_GET_SECCOMP	21
+ #define PR_SET_SECCOMP	22
++#define PR_DRACO_SECCOMP 1000
+ 
+ /* Get/set the capability bounding set (as per security/commoncap.c) */
+ #define PR_CAPBSET_READ 23
+diff --git a/kernel/fork.c b/kernel/fork.c
+index d3f006e..11cc77b 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -888,6 +888,8 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
+ 	 * the usage counts on the error path calling free_task.
+ 	 */
+ 	tsk->seccomp.filter = NULL;
++	tsk->seccomp.draco_hook = NULL;
++	INIT_LIST_HEAD(&(tsk->seccomp.draco_head));
+ #endif
+ 
+ 	setup_thread_stack(tsk, orig);
+diff --git a/kernel/seccomp.c b/kernel/seccomp.c
+index 811b4a8..bcbff5e 100644
+--- a/kernel/seccomp.c
++++ b/kernel/seccomp.c
+@@ -917,17 +917,33 @@ static int __seccomp_filter(int this_syscall, const struct seccomp_data *sd,
+ }
+ #endif
+ 
++int empty_draco(int this_syscall, struct pt_regs *regs) 
++{
++	return 0;
++}
++
++int (*draco_checker)(int, struct pt_regs*) = empty_draco;
++int (*draco_checker_backup)(int, struct pt_regs*) = empty_draco;
++
++EXPORT_SYMBOL(draco_checker);
++EXPORT_SYMBOL(draco_checker_backup);
++
+ int __secure_computing(const struct seccomp_data *sd)
+ {
+ 	int mode = current->seccomp.mode;
+ 	int this_syscall;
+-
++	
+ 	if (IS_ENABLED(CONFIG_CHECKPOINT_RESTORE) &&
+ 	    unlikely(current->ptrace & PT_SUSPEND_SECCOMP))
+ 		return 0;
+ 
+ 	this_syscall = sd ? sd->nr :
+ 		syscall_get_nr(current, task_pt_regs(current));
++	
++	if ((*draco_checker)(this_syscall, task_pt_regs(current))) 
++	{
++		return 0;
++	}
+ 
+ 	switch (mode) {
+ 	case SECCOMP_MODE_STRICT:
+@@ -1442,6 +1458,20 @@ long prctl_set_seccomp(unsigned long seccomp_mode, void __user *filter)
+ 	return do_seccomp(op, 0, uargs);
+ }
+ 
++long prctl_draco_seccomp(int syscall, int arg_position) 
++{	
++	struct seccomp_draco_block* inserted = kmalloc(sizeof(struct seccomp_draco_block), GFP_KERNEL);
++	if (inserted == NULL) 
++		return -ENOMEM;	
++
++	inserted->arg_position = arg_position;
++	inserted->syscall = syscall;
++
++	list_add(&(inserted->list), &(current->seccomp.draco_head));
++	
++	return 0;
++}
++
+ #if defined(CONFIG_SECCOMP_FILTER) && defined(CONFIG_CHECKPOINT_RESTORE)
+ static struct seccomp_filter *get_nth_filter(struct task_struct *task,
+ 					     unsigned long filter_off)
+diff --git a/kernel/sys.c b/kernel/sys.c
+index 2969304..7ab0ab5 100644
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@ -2353,6 +2353,9 @@ int __weak arch_prctl_spec_ctrl_set(struct task_struct *t, unsigned long which,
+ 	case PR_SET_SECCOMP:
+ 		error = prctl_set_seccomp(arg2, (char __user *)arg3);
+ 		break;
++	case PR_DRACO_SECCOMP:
++		error = prctl_draco_seccomp(arg2, arg3);
++		break;
+ 	case PR_GET_TSC:
+ 		error = GET_TSC_CTL(arg2);
+ 		break;
+diff --git a/tools/include/uapi/linux/prctl.h b/tools/include/uapi/linux/prctl.h
+index 094bb03..b91a608 100644
+--- a/tools/include/uapi/linux/prctl.h
++++ b/tools/include/uapi/linux/prctl.h
+@@ -66,6 +66,7 @@
+ /* Get/set process seccomp mode */
+ #define PR_GET_SECCOMP	21
+ #define PR_SET_SECCOMP	22
++#define PR_DRACO_SECCOMP 1000
+ 
+ /* Get/set the capability bounding set (as per security/commoncap.c) */
+ #define PR_CAPBSET_READ 23

@@ -1,0 +1,175 @@
+commit b19ef47b511749cfc99240f662f553afeff0410a
+Author: gshe <gshe@localhost.localdomain>
+Date:   Fri Aug 30 08:29:26 2019 -0400
+
+    second
+
+diff --git a/include/linux/seccomp.h b/include/linux/seccomp.h
+index 5cc1b8e..f8f7547 100644
+--- a/include/linux/seccomp.h
++++ b/include/linux/seccomp.h
+@@ -11,7 +11,15 @@
+ #include <linux/thread_info.h>
+ #include <asm/seccomp.h>
+ 
++#define SYSCALL_COUNT 400
++#define MAX_ARGUMENT_COUNT 6
++
+ struct seccomp_filter;
++
++struct seccomp_draco_block {
++	char fill;
++	int arg_position;
++};
+ /**
+  * struct seccomp - the state of a seccomp'ed process
+  *
+@@ -26,8 +34,17 @@ struct seccomp_filter;
+ struct seccomp {
+ 	int mode;
+ 	struct seccomp_filter *filter;
++	void *draco_hook;
++	int draco_count;
++	int bit_map[SYSCALL_COUNT]; //The information for filled syscall.
++	struct seccomp_draco_block draco[SYSCALL_COUNT];
++	uint8_t sys2arguments[SYSCALL_COUNT][MAX_ARGUMENT_COUNT];
++	uint8_t argument_count_table[SYSCALL_COUNT];
+ };
+ 
++extern int (*draco_checker)(int, struct pt_regs*);
++extern int (*draco_checker_backup)(int, struct pt_regs*);
++
+ #ifdef CONFIG_HAVE_ARCH_SECCOMP_FILTER
+ extern int __secure_computing(void);
+ static inline int secure_computing(void)
+@@ -42,6 +59,8 @@ extern void secure_computing_strict(int this_syscall);
+ 
+ extern long prctl_get_seccomp(void);
+ extern long prctl_set_seccomp(unsigned long, char __user *);
++extern long prctl_draco_add_seccomp(int, int);
++extern long prctl_draco_load_seccomp(void);
+ 
+ static inline int seccomp_mode(struct seccomp *s)
+ {
+diff --git a/include/uapi/linux/prctl.h b/include/uapi/linux/prctl.h
+index a817b5c..0acb42c 100644
+--- a/include/uapi/linux/prctl.h
++++ b/include/uapi/linux/prctl.h
+@@ -66,6 +66,9 @@
+ #define PR_GET_SECCOMP	21
+ #define PR_SET_SECCOMP	22
+ 
++#define PR_DRACO_LOAD_SECCOMP 1000
++#define PR_DRACO_ADD_SECCOMP 1001
++
+ /* Get/set the capability bounding set (as per security/commoncap.c) */
+ #define PR_CAPBSET_READ 23
+ #define PR_CAPBSET_DROP 24
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 9bff3b2..77ea9ac 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -360,7 +360,10 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
+ 	 * then. Until then, filter must be NULL to avoid messing up
+ 	 * the usage counts on the error path calling free_task.
+ 	 */
++	memset(&(tsk->seccomp), 0, sizeof(struct seccomp));
+ 	tsk->seccomp.filter = NULL;
++	tsk->seccomp.draco_hook = NULL;
++	tsk->seccomp.draco_count = 0;
+ #endif
+ 
+ 	setup_thread_stack(tsk, orig);
+diff --git a/kernel/seccomp.c b/kernel/seccomp.c
+index 512c4e9..5a5e696 100644
+--- a/kernel/seccomp.c
++++ b/kernel/seccomp.c
+@@ -735,11 +735,27 @@ static int __seccomp_filter(int this_syscall, struct pt_regs *regs)
+ }
+ #endif
+ 
++int empty_draco(int this_syscall, struct pt_regs *regs) 
++{
++	return 0;
++}
++
++int (*draco_checker)(int, struct pt_regs*) = empty_draco;
++int (*draco_checker_backup)(int, struct pt_regs*) = empty_draco;
++
++EXPORT_SYMBOL(draco_checker);
++EXPORT_SYMBOL(draco_checker_backup);
++
+ int __secure_computing(void)
+ {
+ 	int mode = current->seccomp.mode;
+ 	struct pt_regs *regs = task_pt_regs(current);
+ 	int this_syscall = syscall_get_nr(current, regs);
++	
++	if ((*draco_checker)(this_syscall, task_pt_regs(current))) 
++	{
++		return 0;
++	}
+ 
+ 	switch (mode) {
+ 	case SECCOMP_MODE_STRICT:
+@@ -935,6 +951,43 @@ long prctl_set_seccomp(unsigned long seccomp_mode, char __user *filter)
+ 	return do_seccomp(op, 0, uargs);
+ }
+ 
++long prctl_draco_add_seccomp(int syscall, int arg_position) 
++{    
++	if (syscall < 0 || syscall >= SYSCALL_COUNT)
++		return -1;
++   
++	if (current->seccomp.draco[syscall].fill == 0) { 
++		current->seccomp.draco[syscall].fill = 1;
++		current->seccomp.bit_map[current->seccomp.draco_count] = syscall;
++		current->seccomp.draco_count += 1;
++	}    
++	current->seccomp.draco[syscall].arg_position |= arg_position;    
++	return 0;
++}
++		
++long prctl_draco_load_seccomp(void)
++{
++	struct seccomp* sec = &(current->seccomp);
++	int i;
++	for (i = 0; i < sec->draco_count; ++i) {
++		int syscall = sec->bit_map[i];
++		int arg_position = sec->draco[syscall].arg_position;
++		uint8_t pos = 0;
++		int j = 1;
++		while (arg_position > 0) {
++			int bit = arg_position & 1;
++			if (bit) {
++				sec->sys2arguments[syscall][pos] = j; 
++				pos += 1;
++				}
++			arg_position >>= 1;
++			j += 1;
++		}
++		sec->argument_count_table[syscall] = pos;
++	}
++	return 0;
++}
++
+ #ifdef CONFIG_SYSCTL
+ 
+ /* Human readable action names for friendly sysctl interaction */
+diff --git a/kernel/sys.c b/kernel/sys.c
+index 1fbf388..e104c27 100644
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@ -2422,6 +2422,12 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
+ 	case PR_SET_SECCOMP:
+ 		error = prctl_set_seccomp(arg2, (char __user *)arg3);
+ 		break;
++	case PR_DRACO_LOAD_SECCOMP:
++		error = prctl_draco_load_seccomp();
++		break;
++	case PR_DRACO_ADD_SECCOMP:
++		error = prctl_draco_add_seccomp(arg2, arg3);
++		break;
+ 	case PR_GET_TSC:
+ 		error = GET_TSC_CTL(arg2);
+ 		break;
